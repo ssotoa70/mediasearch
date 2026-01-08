@@ -1,0 +1,152 @@
+sequenceDiagram
+    autonumber
+    actor Ops as Ops/User
+    participant Q as Job Queue
+    participant ORC as Orchestrator Service
+    participant DBa as Database<br/>media_assets
+    participant ASR as ASR Engine Adapter
+    participant ENG as ASR Engine
+    participant SEG as Chunking + Diarization
+    participant DBs as Database<br/>transcript_segments
+    participant EMB as Embedding Service
+    participant DBv as Database<br/>transcript_embeddings
+    participant DLQ as Dead Letter Queue
+    participant TRI as Triage Service
+    participant MON as Monitoring/Alerts
+
+    Note over ORC,DBa: Failure handling, retries, idempotency,<br/>DLQ + triage states
+
+    %% -----------------------
+    %% Job consumption + idempotency gate
+    %% -----------------------
+    ORC-->>Q: Consume job
+    Q-->>ORC: job(asset_id, version_id, engine_policy,<br/>attempt, idempotency_key)
+
+    ORC->>DBa: Read media_assets(asset_id)
+    alt Asset missing or tombstoned
+        ORC->>DBa: status=SKIPPED<br/>reason=ASSET_DELETED_OR_MISSING
+        ORC->>MON: metric(skipped_jobs++)
+        ORC-->>Q: Ack job
+    else Already processed (idempotency hit)
+        ORC->>DBa: Verify version is INDEXED
+        ORC->>MON: metric(idempotent_hits++)
+        ORC-->>Q: Ack job
+    else Proceed with processing
+        ORC->>DBa: status=TRANSCRIBING<br/>attempt=attempt
+    end
+
+    %% -----------------------
+    %% ASR execution failures
+    %% -----------------------
+    alt Proceed with processing
+        ORC->>ASR: Select engine + CPU/GPU mode
+        ASR->>ENG: Run ASR + diarization request
+
+        alt Transient ASR failure (timeout/oom/503)
+            ENG--xASR: Error(transient)
+            ASR-->>ORC: classification=RETRYABLE + error
+            ORC->>MON: metric(asr_retryable_errors++)
+            ORC->>DBa: status=PENDING_RETRY<br/>last_error + attempt
+            ORC->>Q: Re-enqueue with backoff (attempt++)
+            ORC-->>Q: Ack current job
+
+        else Permanent ASR failure (bad media/unsupported codec)
+            ENG--xASR: Error(permanent)
+            ASR-->>ORC: classification=NON_RETRYABLE + error
+            ORC->>MON: metric(asr_nonretryable_errors++)
+            ORC->>DBa: status=QUARANTINED<br/>triage_state=NEEDS_MEDIA_FIX<br/>last_error
+            ORC->>DLQ: Send payload + context
+            ORC-->>Q: Ack job
+
+        else ASR success
+            ENG-->>ASR: Transcript + timecodes + speakers
+            ASR-->>ORC: Normalized ASR output
+        end
+    end
+
+    %% -----------------------
+    %% Chunk + write segments (with staging/promote)
+    %% -----------------------
+    alt ASR success
+        ORC->>SEG: Decide chunking<br/>(sentence-level else 5s)<br/>+ normalize speakers
+        SEG-->>ORC: Segments batch
+
+        ORC->>DBs: Upsert segments (batched)<br/>key=(asset_id, version_id, segment_id)<br/>visibility=STAGING
+        alt DB write transient failure
+            DBs--xORC: Error(transient)
+            ORC->>MON: metric(db_retryable_errors++)
+            ORC->>DBa: status=PENDING_RETRY<br/>last_error
+            Note over ORC,DBs: Idempotency via (asset_id,version_id,segment_id)<br/>prevents dupes on retry
+            ORC->>Q: Re-enqueue with backoff (attempt++)
+            ORC-->>Q: Ack job
+
+        else DB write success
+            DBs-->>ORC: OK (segments_written=N)
+            ORC->>DBa: status=TRANSCRIBED
+        end
+    end
+
+    %% -----------------------
+    %% Embeddings failures
+    %% -----------------------
+    opt Semantic/Hybrid enabled
+        ORC->>EMB: Trigger embedding job(asset_id, version_id)
+        alt Embedding transient failure
+            EMB--xORC: Error(transient)
+            ORC->>MON: metric(embedding_retryable_errors++)
+            ORC->>DBa: status=PENDING_RETRY<br/>last_error
+            ORC->>Q: Re-enqueue with backoff (attempt++)
+
+        else Embedding permanent failure
+            EMB--xORC: Error(permanent)
+            ORC->>MON: metric(embedding_nonretryable_errors++)
+            ORC->>DBa: status=INDEX_PARTIAL<br/>note=KEYWORD_ONLY_AVAILABLE
+            Note over ORC,DBa: Keyword search remains functional
+
+        else Embedding success
+            EMB->>DBv: Upsert vectors<br/>key=(asset_id, version_id, segment_id)
+            DBv-->>EMB: OK
+            EMB-->>ORC: OK
+        end
+    end
+
+    %% -----------------------
+    %% Publish cutover
+    %% -----------------------
+    alt Processing complete
+        ORC->>DBs: Promote visibility STAGING to ACTIVE
+        ORC->>DBv: Promote visibility STAGING to ACTIVE
+        ORC->>DBa: Set current_version_id (atomic flip)
+        ORC->>DBa: status=INDEXED
+    end
+
+    %% -----------------------
+    %% Retry exhaustion -> quarantine + DLQ
+    %% -----------------------
+    alt attempt >= MAX_ATTEMPTS (5) and still retryable
+        ORC->>DBa: status=QUARANTINED<br/>triage_state=NEEDS_ENGINE_TUNING<br/>reason=RETRY_EXHAUSTED
+        ORC->>DLQ: Send payload + context
+        ORC->>MON: Alert(failed_assets++)
+        ORC-->>Q: Ack job
+    end
+
+    %% -----------------------
+    %% DLQ triage workflow + operator actions
+    %% -----------------------
+    DLQ-->>TRI: Process DLQ item
+    TRI->>TRI: Classify error<br/>(media vs engine vs infra)
+    TRI->>DBa: Update triage_state +<br/>recommended_action
+
+    alt Triage = NEEDS_MEDIA_FIX
+        Note over Ops,DBa: Actions: re-encode audio,<br/>fix container, re-upload
+        Ops->>S3: Re-upload fixed media
+        Note over S3,ORC: New ObjectCreated triggers pipeline
+    else Triage = NEEDS_ENGINE_TUNING
+        Note over Ops,DBa: Actions: switch engine,<br/>enable GPU, adjust thresholds
+        Ops->>TRI: Retry with engine override
+        TRI->>Q: Enqueue reprocess job(attempt=0)
+    else Triage = QUARANTINED
+        Note over Ops,DBa: Hold for review
+        Ops->>TRI: Skip with reason
+        TRI->>DBa: status=FAILED
+    end

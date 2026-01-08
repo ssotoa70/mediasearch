@@ -1,0 +1,121 @@
+sequenceDiagram
+    autonumber
+    actor U as User/App
+    actor Ops as Ops/User
+    participant S3 as S3-Compatible Bucket<br/>(VAST S3 or MinIO)
+    participant N as Bucket Notifications
+    participant ING as Ingest Service
+    participant DBa as Database<br/>media_assets
+    participant DBs as Database<br/>transcript_segments
+    participant DBv as Database<br/>transcript_embeddings
+    participant Q as Job Queue<br/>(Redis/BullMQ or VAST DB)
+    participant ORC as Orchestrator Service
+    participant MON as Monitoring/Alerts
+
+    Note over S3,ORC: Update/overwrite + delete lifecycle<br/>(version management + atomic cutover)
+
+    %% =========================================================
+    %% ObjectCreated (new or overwrite)
+    %% =========================================================
+    alt ObjectCreated (new upload) or overwrite (same key, new bytes)
+        U->>S3: PUT object (bucket/key)
+        S3->>N: ObjectCreated event (bucket,key,etag,size,mtime)
+        N->>ING: Invoke ingest(event)
+
+        Note over ING,DBa: Compute strong version_id<br/>(hash/etag + size + mtime)<br/>Store as current_version_id
+
+        ING->>ING: Compute version_id + detect content change
+        ING->>DBa: Upsert asset record<br/>status=INGESTED<br/>current_version_id=version_id
+
+        %% --- Branch: content unchanged
+        alt Content unchanged (idempotent PUT / duplicate event)
+            ING->>MON: metric(duplicate_events++)
+            ING-->>DBa: No-op (keep current index)
+            ING-->>N: Return OK
+        else Content changed (true overwrite)
+            %% =================================================
+            %% Overwrite strategy: two-version approach
+            %% =================================================
+            Note over ING,DBs: Two-version approach:<br/>Keep old version ACTIVE while new version builds in STAGING,<br/>then atomically flip current_version_id.
+
+            %% Mark new version as building (staging)
+            ING->>DBa: Create/Update version row<br/>version_id status=BUILDING<br/>visibility=STAGING
+            ING->>Q: Enqueue job(asset_id, version_id, attempt=0)
+
+            %% ---- Existing version remains ACTIVE until flip
+            Note over DBa,DBs: Search queries MUST filter:<br/>asset.current_version_id AND visibility=ACTIVE
+        end
+    end
+
+    %% =========================================================
+    %% Build new version (transcribe + index)
+    %% =========================================================
+    opt (Triggered only for changed content) Build pipeline
+        ORC-->>Q: Consume job(asset_id, version_id)
+        Q-->>ORC: Job payload
+        ORC->>DBa: Set version status=TRANSCRIBING
+
+        Note over ORC,DBs: Pipeline writes segments/embeddings with visibility=STAGING<br/>keyed by (asset_id, version_id, segment_id)
+
+        ORC->>DBs: Write transcript_segments<br/>visibility=STAGING
+        opt Semantic/Hybrid enabled
+            ORC->>DBv: Write transcript_embeddings<br/>visibility=STAGING
+        end
+        ORC->>DBa: Set version status=READY_TO_PUBLISH
+    end
+
+    %% =========================================================
+    %% Publish flip (atomic cutover)
+    %% =========================================================
+    opt Publish cutover when READY_TO_PUBLISH
+        Note over ORC,DBa: Atomic publish:<br/>update pointer first OR within transaction
+
+        ORC->>DBa: Atomically set asset.current_version_id = new version_id
+
+        ORC->>DBs: Promote new version segments<br/>visibility STAGING -> ACTIVE<br/>where asset_id + new version_id
+        opt Semantic/Hybrid enabled
+            ORC->>DBv: Promote new version embeddings<br/>visibility STAGING -> ACTIVE
+        end
+
+        %% Deactivate old version (safe cleanup)
+        ORC->>DBs: Demote old version segments<br/>visibility ACTIVE -> ARCHIVED
+        opt Semantic/Hybrid enabled
+            ORC->>DBv: Demote old version embeddings<br/>visibility ACTIVE -> ARCHIVED
+        end
+
+        ORC->>DBa: Mark new version status=PUBLISHED<br/>old version status=ARCHIVED
+        ORC->>MON: metric(version_publish_success++)
+    end
+
+    %% =========================================================
+    %% ObjectRemoved (delete)
+    %% =========================================================
+    alt ObjectRemoved (delete)
+        U->>S3: DELETE object (bucket/key)
+        S3->>N: ObjectRemoved event
+        N->>ING: Invoke ingest(event)
+
+        Note over ING,DBa: Tombstone record:<br/>Keep minimal metadata for audit + prevent resurrection<br/>unless a new upload occurs.
+
+        ING->>DBa: Mark asset status=DELETED<br/>set tombstone=true<br/>clear current_version_id
+        ING->>DBs: Set all segments visibility -> SOFT_DELETED<br/>where asset_id
+        ING->>DBv: Set all embeddings visibility -> SOFT_DELETED<br/>where asset_id
+
+        Note over ING,Q: Cancel or ignore in-flight jobs<br/>by checking asset status before processing.
+
+        ING->>Q: (Optional) Publish cancel marker<br/>or rely on orchestrator skip check
+        ING->>MON: metric(delete_events++)
+    end
+
+    %% =========================================================
+    %% Re-upload after delete (resurrection rules)
+    %% =========================================================
+    opt Re-upload same key after delete
+        Ops->>DBa: Policy decision:<br/>Allow resurrection? (default: yes)<br/>If yes, create new asset_id or reuse asset_id with new lineage_id
+        Note over DBa,DBs: Track lineage_id<br/>(asset history across deletes/rewrites)<br/>for audit and debugging.
+    end
+
+    %% =========================================================
+    %% Operational guidelines
+    %% =========================================================
+    Note over MON,DBa: Guidelines:<br/>1) Enforce queries filter: visibility=ACTIVE<br/>2) Maintain retention policy for ARCHIVED (e.g., 7-30 days)<br/>3) Track counters: ingest_version, segment_count, embed_count<br/>4) Add a force_reindex flag per asset/version<br/>5) Store codec + audio extraction checksum for debugging

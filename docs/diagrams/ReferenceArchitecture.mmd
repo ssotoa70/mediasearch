@@ -1,0 +1,81 @@
+flowchart LR
+    %% =====================
+    %% Ingest Layer
+    %% =====================
+    U[User / Application] -->|Upload Media| S3[S3-Compatible Bucket<br/>VAST S3 or MinIO]
+
+    S3 -->|Bucket Notification<br/>ObjectCreated / Removed| EB[Event Notification]
+
+    %% =====================
+    %% Orchestration Layer
+    %% =====================
+    EB --> DEI[Ingest Service]
+
+    DEI -->|Extract Metadata<br/>Create Asset Record| DB1[(Database<br/>media_assets)]
+
+    DEI -->|Queue Job| Q[Transcription Job Queue<br/>Redis/BullMQ or VAST DB]
+
+    %% =====================
+    %% Transcription Layer
+    %% =====================
+    Q --> DET[Orchestrator Service]
+
+    DET -->|Select Engine<br/>CPU or GPU| ASR[ASR Engine Adapter]
+
+    ASR -->|Default| NIM[NVIDIA NIMs<br/>ASR Models]
+    ASR -->|Alternative| WSP[Whisper]
+    ASR -->|Custom| BYO[BYO ASR Engine]
+    ASR -->|Development| STB[Stub Adapter]
+
+    NIM -->|Audio Inference| SEG[Segmentation Logic]
+    WSP -->|Audio Inference| SEG
+    BYO -->|Audio Inference| SEG
+    STB -->|Mock Data| SEG
+
+    %% =====================
+    %% Chunking & Diarization
+    %% =====================
+    SEG -->|Sentence-Level<br/>Default| SNT[Sentence Segments]
+    SEG -->|Fallback<br/>5s Windows| WIN[Fixed Window Segments]
+
+    SNT --> DIA[Speaker Diarization]
+    WIN --> DIA
+
+    DIA -->|Write Segments<br/>visibility=STAGING| DB2[(Database<br/>transcript_segments)]
+
+    %% =====================
+    %% Embeddings
+    %% =====================
+    DB2 -->|Generate Embeddings| EMB[Embedding Service]
+
+    EMB --> DB3[(Database<br/>transcript_embeddings<br/>Vector Store)]
+
+    %% =====================
+    %% Publish & Cutover
+    %% =====================
+    DET -->|Atomic Flip<br/>STAGING to ACTIVE| PUB[Version Publisher]
+    PUB --> DB1
+    PUB --> DB2
+    PUB --> DB3
+
+    %% =====================
+    %% Search Layer
+    %% =====================
+    UI[Search UI / API Client] --> SRCH[Search API Service]
+
+    SRCH -->|Keyword Search| DB2
+    SRCH -->|Semantic Search| DB3
+    SRCH -->|Hybrid Ranking<br/>+ Filters| DB2
+
+    %% =====================
+    %% Triage
+    %% =====================
+    DET -->|Failed Jobs| DLQ[Dead Letter Queue]
+    DLQ --> TRI[Triage Service]
+    TRI --> DB1
+
+    %% =====================
+    %% Playback
+    %% =====================
+    SRCH -->|Results + Timestamps| UI
+    UI -->|Seek to start_ms| P[Media Player]

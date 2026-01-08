@@ -1,0 +1,94 @@
+sequenceDiagram
+    autonumber
+    actor U as User/App
+    participant S3 as S3 Bucket
+    participant N as Bucket Notifications
+    participant ING as Ingest Service
+    participant DBa as Database<br/>media_assets
+    participant Q as Job Queue
+    participant ORC as Orchestrator Service
+    participant ASR as ASR Engine Adapter
+    participant NIM as NVIDIA NIMs
+    participant SEG as Chunking/Segmentation
+    participant DIA as Speaker Diarization
+    participant DBs as Database<br/>transcript_segments
+    participant EMB as Embedding Service
+    participant DBv as Database<br/>transcript_embeddings
+    participant API as Search API
+    participant UI as Search UI / Client
+    participant P as Player
+
+    %% -----------------------
+    %% Ingest
+    %% -----------------------
+    U->>S3: Upload media object (audio/video)
+    S3->>N: Emit ObjectCreated notification
+    N->>ING: Invoke ingest service (event payload)
+
+    ING->>ING: Validate format + compute version_id
+    ING->>DBa: Upsert media_assets<br/>status=INGESTED
+    ING->>Q: Enqueue transcription job<br/>(asset_id, version_id, engine_policy)
+
+    %% -----------------------
+    %% Transcription orchestration
+    %% -----------------------
+    ORC-->>Q: Poll/consume job
+    Q-->>ORC: Job payload
+    ORC->>DBa: Mark status=TRANSCRIBING
+
+    ORC->>ASR: Select engine + execution mode (CPU/GPU)
+    alt Default Engine = NVIDIA NIMs
+        ASR->>NIM: Submit ASR + diarization request
+        NIM-->>ASR: Transcript + timecodes + speakers
+    else Engine = Whisper/BYO/Stub
+        ASR->>ASR: Use selected engine
+        ASR-->>ORC: Transcript + timecodes + speakers
+    end
+
+    %% -----------------------
+    %% Chunking & diarization
+    %% -----------------------
+    ASR->>SEG: Normalize transcript for indexing
+    alt Sentence-level segmentation feasible
+        SEG->>SEG: Split by sentence boundaries<br/>align start_ms/end_ms
+    else Compute threshold exceeded
+        SEG->>SEG: Split into fixed 5-second windows<br/>align start_ms/end_ms
+    end
+
+    SEG->>DIA: Attach speaker labels per segment
+    DIA->>DBs: Write transcript_segments<br/>visibility=STAGING
+    DIA->>DBa: Mark status=TRANSCRIBED
+
+    %% -----------------------
+    %% Embeddings for semantic/hybrid search
+    %% -----------------------
+    opt Semantic or Hybrid enabled
+        DBs->>EMB: Trigger embedding generation
+        EMB->>DBv: Store transcript_embeddings<br/>visibility=STAGING
+    end
+
+    %% -----------------------
+    %% Publish cutover (atomic)
+    %% -----------------------
+    ORC->>DBa: Set current_version_id (atomic pointer flip)
+    ORC->>DBs: Promote visibility STAGING to ACTIVE
+    ORC->>DBv: Promote visibility STAGING to ACTIVE
+    ORC->>DBa: Mark status=INDEXED
+
+    %% -----------------------
+    %% Search + playback
+    %% -----------------------
+    UI->>API: Query (keyword / semantic / hybrid + filters)
+    alt Keyword search
+        API->>DBs: Search transcript_segments<br/>WHERE visibility=ACTIVE
+        DBs-->>API: Hits (asset_id, start_ms, snippet, score)
+    else Semantic search
+        API->>DBv: Vector search<br/>WHERE visibility=ACTIVE
+        DBv-->>API: Hits (asset_id, start_ms, snippet, score)
+    else Hybrid search
+        API->>DBs: Keyword candidates
+        API->>DBv: Semantic candidates
+        API->>API: Merge + rank (hybrid scoring)
+    end
+    API-->>UI: Results with timestamps + asset references
+    UI->>P: Seek playback to start_ms
