@@ -1,0 +1,29 @@
+{
+  "name": "@mediasearch/triage",
+  "version": "1.0.0",
+  "description": "Triage service - manages DLQ items and quarantined assets",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "prettier --check src/"
+  },
+  "dependencies": {
+    "@mediasearch/domain": "workspace:*",
+    "@mediasearch/local-postgres": "workspace:*",
+    "@mediasearch/local-queue": "workspace:*",
+    "@mediasearch/vast-database": "workspace:*",
+    "@mediasearch/vast-dataengine": "workspace:*",
+    "fastify": "^4.26.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  }
+}
