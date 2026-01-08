@@ -1,0 +1,213 @@
+# MediaSearch Local Development Environment
+#
+# This docker-compose file provides local emulation of:
+# - VAST S3-compatible storage -> MinIO
+# - VAST DataBase -> PostgreSQL + pgvector
+# - Job queue -> Redis
+#
+# For production, use VAST DataEngine + DataBase instead.
+# See docs/DEPLOY_ON_VAST.md for production deployment.
+
+services:
+  # PostgreSQL with pgvector - emulates VAST DataBase locally
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: mediasearch-postgres
+    environment:
+      POSTGRES_USER: mediasearch
+      POSTGRES_PASSWORD: mediasearch
+      POSTGRES_DB: mediasearch
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mediasearch"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis - emulates job queue (VAST uses DataBase tables for queue)
+  redis:
+    image: redis:7-alpine
+    container_name: mediasearch-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # MinIO - emulates VAST S3-compatible storage
+  minio:
+    image: minio/minio:latest
+    container_name: mediasearch-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # Console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # MinIO client for bucket setup and notifications
+  minio-setup:
+    image: minio/mc:latest
+    container_name: mediasearch-minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb local/media --ignore-existing;
+      mc mb local/transcripts --ignore-existing;
+      mc event add local/media arn:minio:sqs::PRIMARY:webhook --event put,delete --ignore-existing || true;
+      echo 'MinIO buckets configured';
+      exit 0;
+      "
+
+  # Webhook receiver for MinIO notifications (ingest service)
+  # In production, VAST bucket notifications invoke DataEngine functions
+  ingest:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        SERVICE: ingest
+    container_name: mediasearch-ingest
+    environment:
+      - BACKEND=local
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=mediasearch
+      - POSTGRES_USER=mediasearch
+      - POSTGRES_PASSWORD=mediasearch
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MEDIA_BUCKET=media
+      - PORT=3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Job orchestrator - processes transcription jobs
+  orchestrator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        SERVICE: orchestrator
+    container_name: mediasearch-orchestrator
+    environment:
+      - BACKEND=local
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=mediasearch
+      - POSTGRES_USER=mediasearch
+      - POSTGRES_PASSWORD=mediasearch
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MEDIA_BUCKET=media
+      - ASR_ENGINE=stub
+      - EMBEDDING_USE_STUB=true
+      - MAX_RETRY_ATTEMPTS=5
+      - JOB_CONCURRENCY=2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  # Search API
+  search-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        SERVICE: search-api
+    container_name: mediasearch-search-api
+    environment:
+      - BACKEND=local
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=mediasearch
+      - POSTGRES_USER=mediasearch
+      - POSTGRES_PASSWORD=mediasearch
+      - EMBEDDING_USE_STUB=true
+      - PORT=3001
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Triage service for DLQ processing
+  triage:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        SERVICE: triage
+    container_name: mediasearch-triage
+    environment:
+      - BACKEND=local
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=mediasearch
+      - POSTGRES_USER=mediasearch
+      - POSTGRES_PASSWORD=mediasearch
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PORT=3002
+    ports:
+      - "3002:3002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+
+networks:
+  default:
+    name: mediasearch-network
