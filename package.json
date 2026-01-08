@@ -1,6 +1,6 @@
 {
   "name": "mediasearch",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Media Transcription & Search Platform on VAST Data",
   "private": true,
   "type": "module",

@@ -1,6 +1,11 @@
 # MediaSearch
 
-A media transcription, indexing, and search platform designed for VAST Data infrastructure. MediaSearch ingests audio and video files, transcribes them using pluggable ASR engines, generates vector embeddings, and provides keyword, semantic, and hybrid search capabilities with sub-second latency.
+[![CI](https://github.com/ssotoa70/mediasearch/actions/workflows/ci.yml/badge.svg)](https://github.com/ssotoa70/mediasearch/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![GitHub release](https://img.shields.io/github/v/release/ssotoa70/mediasearch)](https://github.com/ssotoa70/mediasearch/releases)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen)](https://nodejs.org/)
+
+A media transcription, indexing, and search platform **built exclusively for VAST Data infrastructure**. MediaSearch ingests audio and video files, transcribes them using pluggable ASR engines, generates vector embeddings, and provides keyword, semantic, and hybrid search capabilities with sub-second latency.
 
 ## Problem Statement
 
@@ -14,27 +19,58 @@ Organizations with large media libraries need to make spoken content searchable.
 
 ## Architecture
 
+MediaSearch is designed as a **VAST-native platform** that leverages VAST Data's unified infrastructure:
+
 ```
-┌─────────────┐     ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│  S3 Bucket  │────▶│   Ingest    │────▶│ Orchestrator │────▶│ Search API  │
-│  (Upload)   │     │   Service   │     │              │     │             │
-└─────────────┘     └─────────────┘     └──────────────┘     └─────────────┘
-                           │                    │
-                           ▼                    ▼
-                    ┌───────────┐        ┌───────────┐
-                    │  Database │        │ ASR/Embed │
-                    │           │        │  Engines  │
-                    └───────────┘        └───────────┘
+┌─────────────────┐     ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│  VAST S3 Bucket │────▶│   Ingest    │────▶│ Orchestrator │────▶│ Search API  │
+│  (Media Upload) │     │   Service   │     │              │     │             │
+└─────────────────┘     └─────────────┘     └──────────────┘     └─────────────┘
+                               │                    │
+                               ▼                    ▼
+                    ┌────────────────┐      ┌───────────┐
+                    │ VAST DataBase  │      │ ASR/Embed │
+                    │ (Index+Vectors)│      │  Engines  │
+                    └────────────────┘      └───────────┘
 ```
+
+### Production Stack (VAST Data)
+
+| Component | VAST Service | Purpose |
+|-----------|--------------|---------|
+| Object Storage | VAST S3-compatible buckets | Media file storage with bucket notifications |
+| Compute | VAST DataEngine | Serverless function execution for ingest/processing |
+| Database | VAST DataBase | Relational tables + vector embeddings with hybrid search |
+
+### Local Development Stack
+
+For development and testing, swappable adapters provide equivalent functionality:
+
+| Production | Local Equivalent | Notes |
+|------------|------------------|-------|
+| VAST S3 | MinIO | S3-compatible object storage |
+| VAST DataEngine | Direct Node.js | In-process execution |
+| VAST DataBase | PostgreSQL + pgvector | Relational + vector search |
 
 **Key Design Principles:**
 
-- **VAST-first architecture**: Production uses VAST DataBase + DataEngine; local dev uses PostgreSQL + Redis + MinIO
+- **VAST-first architecture**: Production uses VAST DataBase + DataEngine exclusively
 - **Adapter pattern**: All infrastructure behind port interfaces with swappable implementations
 - **Lifecycle management**: Versioned assets with atomic visibility transitions (STAGING → ACTIVE → ARCHIVED)
 - **Idempotent operations**: Safe retries with exponential backoff and dead-letter queue
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design documentation.
+
+## Non-Goals
+
+This project intentionally avoids certain architectural patterns:
+
+- **No PostgreSQL in production**: VAST DataBase provides all relational and vector storage needs
+- **No Redis/message queues**: VAST DataEngine handles job orchestration natively
+- **No external object stores**: Media lives in VAST S3-compatible storage only
+- **No cloud-specific services**: No AWS SQS, Azure Service Bus, or GCP Pub/Sub dependencies
+
+The local development adapters (PostgreSQL, Redis, MinIO) exist solely for offline development and are **never deployed to production**. This constraint is enforced by CI guardrails.
 
 ## Prerequisites
 
@@ -139,13 +175,22 @@ mediasearch/
 
 ## Roadmap
 
-- [ ] Real-time streaming transcription
-- [ ] Multi-language support with auto-detection
-- [ ] Speaker identification and clustering
-- [ ] Transcript editing and correction UI
+### Near-term (API Stabilization)
+- [ ] Finalize search API contract and response schema
+- [ ] Add OpenAPI/Swagger documentation
+- [ ] Comprehensive error codes and messages
+
+### Mid-term (Relevance & Quality)
+- [ ] Search relevance tuning (BM25 weights, vector similarity thresholds)
+- [ ] Multi-language ASR support with auto-detection
+- [ ] Speaker diarization improvements
+- [ ] Confidence score calibration
+
+### Long-term (Enterprise Features)
+- [ ] Multi-tenant support with namespace isolation
 - [ ] Webhook notifications for processing events
 - [ ] Prometheus metrics and Grafana dashboards
-- [ ] Kubernetes Helm chart
+- [ ] Transcript editing and correction UI
 
 ## Contributing
 
