@@ -1,0 +1,30 @@
+{
+  "name": "mediasearch",
+  "version": "1.0.0",
+  "description": "Media Transcription & Search Platform on VAST Data",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
+    "test:unit": "pnpm -r --filter './packages/*' test",
+    "test:integration": "pnpm -r --filter './test/*' test",
+    "dev": "docker compose up -d && pnpm -r --parallel dev",
+    "dev:stop": "docker compose down",
+    "demo": "./scripts/demo_end_to_end.sh",
+    "db:migrate": "pnpm --filter @mediasearch/local-postgres migrate",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0",
+    "prettier": "^3.2.5"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  }
+}
