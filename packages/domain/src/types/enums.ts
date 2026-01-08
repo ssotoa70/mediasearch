@@ -10,8 +10,8 @@ export enum AssetStatus {
   DELETED = 'DELETED',
   QUARANTINED = 'QUARANTINED',
   SKIPPED = 'SKIPPED',
-  ERROR_RETRYABLE = 'ERROR_RETRYABLE',
-  EMBEDDING_RETRYABLE = 'EMBEDDING_RETRYABLE',
+  PENDING_RETRY = 'PENDING_RETRY', // Awaiting retry after transient failure
+  FAILED = 'FAILED', // Permanently failed (skipped by operator)
   BUILDING = 'BUILDING',
   READY_TO_PUBLISH = 'READY_TO_PUBLISH',
   PUBLISHED = 'PUBLISHED',
