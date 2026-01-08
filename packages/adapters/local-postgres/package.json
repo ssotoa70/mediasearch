@@ -1,0 +1,27 @@
+{
+  "name": "@mediasearch/local-postgres",
+  "version": "1.0.0",
+  "description": "PostgreSQL + pgvector adapter for local development",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "prettier --check src/",
+    "migrate": "node dist/migrate.js"
+  },
+  "dependencies": {
+    "@mediasearch/domain": "workspace:*",
+    "pg": "^8.12.0",
+    "pgvector": "^0.1.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  }
+}
