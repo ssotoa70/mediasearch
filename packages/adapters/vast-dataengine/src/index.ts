@@ -20,6 +20,17 @@
  */
 
 import {
+  S3Client,
+  GetObjectCommand,
+  PutObjectCommand,
+  DeleteObjectCommand,
+  ListObjectsV2Command,
+  HeadObjectCommand,
+  HeadBucketCommand,
+  CreateBucketCommand,
+} from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import {
   QueuePort,
   StoragePort,
   ConsumeOptions,
@@ -31,6 +42,7 @@ import {
   NotificationSubscription,
   TranscriptionJob,
   S3Event,
+  S3EventType,
 } from '@mediasearch/domain';
 
 // ==================== VAST DataEngine Queue Adapter ====================
@@ -231,38 +243,96 @@ export interface VASTS3Config {
  */
 export class VASTS3Adapter implements StoragePort {
   private config: VASTS3Config;
+  private client: S3Client;
   private connected: boolean = false;
+  private pollingIntervals: Map<string, NodeJS.Timeout> = new Map();
+  private knownObjects: Map<string, Set<string>> = new Map();
 
   constructor(config: VASTS3Config) {
-    this.config = config;
+    this.config = {
+      region: 'us-east-1',
+      ...config,
+    };
+
+    this.client = new S3Client({
+      endpoint: this.config.endpoint,
+      region: this.config.region,
+      credentials: {
+        accessKeyId: this.config.accessKeyId,
+        secretAccessKey: this.config.secretAccessKey,
+      },
+      // VAST S3 may or may not require forcePathStyle - will be configurable if needed
+    });
   }
 
   /**
    * Initialize connection to VAST S3
    */
   async initialize(): Promise<void> {
-    // Initialize S3 client with VAST endpoint
-    // Note: Same AWS SDK works with VAST S3
-
-    console.log(`[VAST S3] Connecting to ${this.config.endpoint}`);
+    // Verify S3 connection with a simple list buckets operation
+    try {
+      const command = new ListObjectsV2Command({ Bucket: 'health-check-bucket', MaxKeys: 1 });
+      await this.client.send(command);
+    } catch (error: unknown) {
+      // NoSuchBucket is expected, indicates connection is working
+      if ((error as { name?: string }).name === 'NoSuchBucket') {
+        console.log(`[VAST S3] Connected to ${this.config.endpoint}`);
+        this.connected = true;
+        return;
+      }
+      throw error;
+    }
+    console.log(`[VAST S3] Connected to ${this.config.endpoint}`);
     this.connected = true;
   }
 
   // ==================== Object Operations ====================
 
   async getObject(bucket: string, key: string): Promise<Buffer> {
-    // TODO: Implement using AWS S3 SDK with VAST endpoint
-    throw new Error('[VAST S3] getObject not implemented - configure VAST credentials');
+    if (!this.connected) throw new Error('[VAST S3] Not connected');
+
+    const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+    const response = await this.client.send(command);
+
+    if (!response.Body) {
+      throw new Error(`[VAST S3] Object ${key} has no body`);
+    }
+
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of response.Body as AsyncIterable<Uint8Array>) {
+      chunks.push(chunk);
+    }
+
+    return Buffer.concat(chunks);
   }
 
   async getObjectMetadata(bucket: string, key: string): Promise<ObjectMetadata> {
-    // TODO: Implement using AWS S3 SDK with VAST endpoint
-    throw new Error('[VAST S3] getObjectMetadata not implemented - configure VAST credentials');
+    if (!this.connected) throw new Error('[VAST S3] Not connected');
+
+    const command = new HeadObjectCommand({ Bucket: bucket, Key: key });
+    const response = await this.client.send(command);
+
+    return {
+      etag: response.ETag?.replace(/"/g, '') || '',
+      size: response.ContentLength || 0,
+      contentType: response.ContentType || 'application/octet-stream',
+      lastModified: response.LastModified || new Date(),
+      metadata: (response.Metadata as Record<string, string>) || {},
+    };
   }
 
   async objectExists(bucket: string, key: string): Promise<boolean> {
-    // TODO: Implement using AWS S3 SDK with VAST endpoint
-    throw new Error('[VAST S3] objectExists not implemented - configure VAST credentials');
+    if (!this.connected) throw new Error('[VAST S3] Not connected');
+
+    try {
+      await this.getObjectMetadata(bucket, key);
+      return true;
+    } catch (error: unknown) {
+      if ((error as { name?: string }).name === 'NotFound') {
+        return false;
+      }
+      throw error;
+    }
   }
 
   async putObject(
@@ -271,30 +341,79 @@ export class VASTS3Adapter implements StoragePort {
     data: Buffer,
     contentType: string
   ): Promise<PutObjectResult> {
-    // TODO: Implement using AWS S3 SDK with VAST endpoint
-    throw new Error('[VAST S3] putObject not implemented - configure VAST credentials');
+    if (!this.connected) throw new Error('[VAST S3] Not connected');
+
+    const command = new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: data,
+      ContentType: contentType,
+    });
+
+    const response = await this.client.send(command);
+
+    return {
+      etag: response.ETag?.replace(/"/g, '') || '',
+      versionId: response.VersionId,
+    };
   }
 
   async deleteObject(bucket: string, key: string): Promise<void> {
-    // TODO: Implement using AWS S3 SDK with VAST endpoint
-    throw new Error('[VAST S3] deleteObject not implemented - configure VAST credentials');
+    if (!this.connected) throw new Error('[VAST S3] Not connected');
+
+    const command = new DeleteObjectCommand({ Bucket: bucket, Key: key });
+    await this.client.send(command);
   }
 
   async listObjects(bucket: string, prefix?: string): Promise<ObjectInfo[]> {
-    // TODO: Implement using AWS S3 SDK with VAST endpoint
-    throw new Error('[VAST S3] listObjects not implemented - configure VAST credentials');
+    if (!this.connected) throw new Error('[VAST S3] Not connected');
+
+    const command = new ListObjectsV2Command({
+      Bucket: bucket,
+      Prefix: prefix,
+    });
+
+    const response = await this.client.send(command);
+    const objects: ObjectInfo[] = [];
+
+    for (const obj of response.Contents || []) {
+      if (obj.Key) {
+        objects.push({
+          key: obj.Key,
+          size: obj.Size || 0,
+          lastModified: obj.LastModified || new Date(),
+          etag: obj.ETag?.replace(/"/g, '') || '',
+        });
+      }
+    }
+
+    return objects;
   }
 
   async getPresignedUrl(bucket: string, key: string, expiresIn: number): Promise<string> {
-    // TODO: Implement using AWS S3 SDK with VAST endpoint
-    throw new Error('[VAST S3] getPresignedUrl not implemented - configure VAST credentials');
+    if (!this.connected) throw new Error('[VAST S3] Not connected');
+
+    const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+    return getSignedUrl(this.client, command, { expiresIn });
   }
 
   // ==================== Bucket Operations ====================
 
   async ensureBucket(bucket: string): Promise<void> {
-    // TODO: Implement bucket creation
-    throw new Error('[VAST S3] ensureBucket not implemented - configure VAST credentials');
+    if (!this.connected) throw new Error('[VAST S3] Not connected');
+
+    try {
+      const headCommand = new HeadBucketCommand({ Bucket: bucket });
+      await this.client.send(headCommand);
+    } catch (error: unknown) {
+      if ((error as { name?: string }).name === 'NotFound') {
+        const createCommand = new CreateBucketCommand({ Bucket: bucket });
+        await this.client.send(createCommand);
+        console.log(`[VAST S3] Created bucket: ${bucket}`);
+      } else {
+        throw error;
+      }
+    }
   }
 
   // ==================== Bucket Notifications ====================
@@ -303,19 +422,84 @@ export class VASTS3Adapter implements StoragePort {
     bucket: string,
     handler: (event: S3Event) => Promise<void>
   ): Promise<NotificationSubscription> {
-    // VAST S3 bucket notifications:
-    // - Configure notification targets via VAST Web UI or API
-    // - Events are delivered to DataEngine functions
-    // - Alternative: Use SQS/SNS compatible endpoints
-    //
-    // In production, the notification subscription is typically
-    // configured at infrastructure level, not in application code.
-    //
-    // This method would register the handler to process incoming events
-    // from the configured notification endpoint.
+    if (!this.connected) throw new Error('[VAST S3] Not connected');
 
-    // TODO: Implement VAST S3 notification subscription
-    throw new Error('[VAST S3] subscribeToNotifications not implemented - configure VAST credentials');
+    // Initialize known objects for this bucket (polling-based for local-like behavior)
+    const existingObjects = await this.listObjects(bucket);
+    const knownKeys = new Set(existingObjects.map((o) => o.key));
+    this.knownObjects.set(bucket, knownKeys);
+
+    console.log(
+      `[VAST S3] Subscribed to notifications for bucket ${bucket} (${knownKeys.size} existing objects)`
+    );
+
+    // Start polling for changes
+    // In production VAST, this would use native bucket notifications
+    // For now, we implement polling similar to local-s3 adapter
+    const intervalId = setInterval(async () => {
+      try {
+        await this.checkForChanges(bucket, handler);
+      } catch (error) {
+        console.error(`[VAST S3] Error polling bucket ${bucket}:`, error);
+      }
+    }, 5000);
+
+    this.pollingIntervals.set(bucket, intervalId);
+
+    return {
+      unsubscribe: async () => {
+        const interval = this.pollingIntervals.get(bucket);
+        if (interval) {
+          clearInterval(interval);
+          this.pollingIntervals.delete(bucket);
+        }
+        this.knownObjects.delete(bucket);
+      },
+    };
+  }
+
+  private async checkForChanges(
+    bucket: string,
+    handler: (event: S3Event) => Promise<void>
+  ): Promise<void> {
+    const currentObjects = await this.listObjects(bucket);
+    const currentKeys = new Set(currentObjects.map((o) => o.key));
+    const knownKeys = this.knownObjects.get(bucket) || new Set();
+
+    // Check for new objects (ObjectCreated)
+    for (const obj of currentObjects) {
+      if (!knownKeys.has(obj.key)) {
+        const event: S3Event = {
+          event_type: S3EventType.OBJECT_CREATED,
+          bucket,
+          object_key: obj.key,
+          etag: obj.etag,
+          size: obj.size,
+          timestamp: obj.lastModified,
+        };
+
+        console.log(`[VAST S3] Object created: ${bucket}/${obj.key}`);
+        await handler(event);
+      }
+    }
+
+    // Check for deleted objects (ObjectRemoved)
+    for (const key of knownKeys) {
+      if (!currentKeys.has(key)) {
+        const event: S3Event = {
+          event_type: S3EventType.OBJECT_REMOVED,
+          bucket,
+          object_key: key,
+          timestamp: new Date(),
+        };
+
+        console.log(`[VAST S3] Object removed: ${bucket}/${key}`);
+        await handler(event);
+      }
+    }
+
+    // Update known objects
+    this.knownObjects.set(bucket, currentKeys);
   }
 
   // ==================== Health & Cleanup ====================
@@ -324,15 +508,32 @@ export class VASTS3Adapter implements StoragePort {
     if (!this.connected) return false;
 
     try {
-      // TODO: Implement health check - list buckets or simple operation
+      // Try to list buckets - simple health check
+      const command = new ListObjectsV2Command({ Bucket: 'health-check-bucket', MaxKeys: 1 });
+      await this.client.send(command);
       return true;
-    } catch {
+    } catch (error: unknown) {
+      // NoSuchBucket is expected if bucket doesn't exist, but connection is fine
+      if ((error as { name?: string }).name === 'NoSuchBucket') {
+        return true;
+      }
+      // Connection errors indicate unhealthy
       return false;
     }
   }
 
   async close(): Promise<void> {
-    // TODO: Close S3 client
+    // Stop all polling intervals
+    for (const [bucket, interval] of this.pollingIntervals) {
+      clearInterval(interval);
+      console.log(`[VAST S3] Stopped polling for bucket ${bucket}`);
+    }
+    this.pollingIntervals.clear();
+    this.knownObjects.clear();
+
+    // S3Client doesn't have explicit close - it uses connection pooling
+    this.client.destroy();
+    console.log('[VAST S3] Closed S3 client');
     this.connected = false;
   }
 }
