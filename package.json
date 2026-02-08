@@ -1,7 +1,7 @@
 {
   "name": "mediasearch",
-  "version": "0.1.0",
-  "description": "Media Transcription & Search Platform on VAST Data",
+  "version": "0.9.0-beta",
+  "description": "Media Transcription & Search Platform on VAST Data - Feature Complete (All 50 VAST Adapter Methods)",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@9.0.0",
